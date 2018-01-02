@@ -3,16 +3,18 @@
 import cgi
 import cgitb
 import datetime
+from functools import reduce
 import json
 import math
 import os
 import requests
 import sys
+import time as ptime
 
+from bmdjson import completed_quarter, get_sha512_32_hash, decode, get_dash_price, get_dash_chain_totals
 from copy import copy
 from datetime import datetime, timedelta, time
 from random import randint
-from bmdjson import completed_quarter, get_sha512_32_hash, decode, get_dash_price, get_dash_chain_totals
 
 ############################################################################
 # File: paywall.py
@@ -37,10 +39,10 @@ WEB_JSON_FILE = "default.json"
 WEB_PAYMENT_COUNT_MAX = 104
 WEB_PAYMENT_NEXT_WEEK = "Sun" 
 WEB_PAYMENT_NEXT_WEEK_PRICE = 100.00
-WEB_PAYMENT_DEPOSIT_LIMIT = 0.4  # 40÷100 usd
+WEB_PAYMENT_DEPOSIT_LIMIT = 0.4  # 40/100 usd
 WEB_PAYMENT_COUNT_CURRENT = 0
 WEB_PAYMENT_IS_NEW_WEEK = "no"
-WEB_DEBUG = "false"
+WEB_DEBUG = "true"
 WEB_TESTING = "no"
 
 #########
@@ -68,35 +70,80 @@ def hrs_until_midnight():
 def str2bool(v):
       return v.lower() in ("yes", "true", "t", "1")
 
-def get_payee_keys(candidates,payment_count_current, payment_count_max,payment_deposit_limit,debug):
+
+def get_payees(candidates):
+    for rec in candidates.keys():
+        candidates[rec]['id'] = rec
+        candidates[rec]['value_received'] = 0.0
+    return [ candidates[rec] for rec in candidates.keys()]
+
+def get_payee_keys(candidates,payment_count_current, payment_count_max,payment_deposit_limit,debug,db):
       payee_keys = []
-      for record in candidates.keys():
-            payee = candidates[record]
+
+      campaign_start_epoch = db['settings'][0]['campaign_start_epoch']
+      payment_new_week_price = db["settings"][0]["payment_new_week_price"]
+      week_seconds = (86400*7)
+      current_week = int((int(ptime.time()) - campaign_start_epoch) / week_seconds) + 1
+      if (debug) :
+            print("\nget_payee_keys()\n")
+            print("current_week: %s" % current_week)
+
+      # calculate per-week values
+      weeks = []
+      payees = get_payees(candidates)
+      payee_start_week = 0
+      for week_epoch in range(campaign_start_epoch, campaign_start_epoch + week_seconds*current_week, week_seconds):
+          payee_start_week += 1
+          week_prices = []
+          for payee in payees:
+              if payee['ts_created'] >= week_epoch and payee['ts_created'] <= week_epoch + week_seconds:
+                  payee['start_week'] = payee_start_week
+              for payment in payee['payments']:
+                  if payment['ts_created'] >= week_epoch and payment['ts_created'] <= week_epoch + week_seconds:
+                      week_prices.append(payment['dash_price'])
+          week_avg_price = (reduce(lambda x, y: x + y, week_prices,1) / (len(week_prices) or 1 ))
+          weeks.append(week_avg_price)
+          for payee in payees:
+              for payment in payee['payments']:
+                  if payment['ts_created'] >= week_epoch and payment['ts_created'] <= week_epoch + week_seconds:
+                      payee['value_received'] = payee['value_received'] + (payment['amount'] * week_avg_price)
+
+      for payee in payees:
             if not payee["active"]:
                   continue
 
             address_balance = payee["address_balance"]
             if (address_balance == 0) :
                   address_balance = .00000001
-            max_payment_todate = float(payment_count_current * payment_deposit_limit)
+            #max_payment_todate = float(payment_count_current * payment_deposit_limit)
+
+            max_payment_todate = address_balance + ((1/payment_new_week_price) * (float(current_week * 40.0) - payee['value_received']))
+
             max_address_deposit_limit = float(payment_count_max * payment_deposit_limit)
             
             if (debug) :
-                  print("address_balance = " + str(address_balance))
-                  print("payment_count_current * payment_deposit_limit = "
+                  print("payee: %s" % payee['id'])
+                  print("  start week %s " % payee_start_week)
+                  print("  address_balance = " + str(address_balance))
+                  print("  payment_count_current * payment_deposit_limit = "
                         + str(float(payment_count_current)) + " * "
                         + str(float(payment_deposit_limit)))
-                  print("max_payment_todate = " + str(max_payment_todate))
-                  print("max_address_deposit_limit = " + str(max_address_deposit_limit))
-                  print("address_balance >= max_address_deposit_limit = "
+                  print("  max_payment_todate = " + str(max_payment_todate))
+                  print("  value_received = %s " % payee['value_received'])
+                  print("  value_allotment= %s " % float(current_week * 40.0))
+                  print("  max_address_deposit_limit = " + str(max_address_deposit_limit))
+                  print("  address_balance >= max_address_deposit_limit = "
                         + str(address_balance >= max_address_deposit_limit))
-                  print("address_balance >= max_payment_todate = "
+                  print("  address_balance >= max_payment_todate = "
                         + str(address_balance >= max_payment_todate))
             
             if (address_balance >= max_address_deposit_limit
                 or address_balance >= max_payment_todate):
                   continue
-            payee_keys.append(record)
+            #if (address_balance >= max_address_deposit_limit
+            #    or payee['value_received'] >= (current_week * 40)):
+            #      continue
+            payee_keys.append(payee['id'])
             continue
       if (debug):
             print("candidates <in> " + str(len(candidates)) + "; payees <out> "
@@ -270,6 +317,10 @@ def paywall_output(json_directory, json_file, payment_count_max, payment_new_wee
             testing = str2bool(testing)
             
             form = cgi.FieldStorage()
+
+            if (debug):
+                print("Content-Type: text/plain\n\n")
+
             if (debug): print(str(form.getvalue("WP")))
             if (form.getvalue("WP") is None):
                   wp = False
@@ -319,6 +370,8 @@ def paywall_output(json_directory, json_file, payment_count_max, payment_new_wee
                   PAYMENT_DEPOSIT_LIMIT = float(db["settings"][0]["payment_deposit_limit"])
                   PAYMENT_COUNT_CURRENT = int(db["settings"][0]["payment_count_current"])
                   PAYMENT_IS_NEW_WEEK = str2bool(str(db["settings"][0]["payment_is_new_week"]))
+                  CAMPAIGN_START_EPOCH = db["settings"][0]["campaign_start_epoch"]
+                  CAMPAIGN_START_DATESTAMP = db["settings"][0]["campaign_start_datestamp"]
                   DEBUG = str2bool(str(db["settings"][0]["debug"]))
             else:
                   if (debug): print("Warning: 'settings' section not found in JSON file; "
@@ -389,7 +442,7 @@ def paywall_output(json_directory, json_file, payment_count_max, payment_new_wee
       else:
             payee_keys = get_payee_keys(candidates,PAYMENT_COUNT_CURRENT,
                                         PAYMENT_COUNT_MAX,
-                                        PAYMENT_DEPOSIT_LIMIT, debug)
+                                        PAYMENT_DEPOSIT_LIMIT, debug, db)
 
       payee_out = []
       current_payment_deposit_limit = PAYMENT_DEPOSIT_LIMIT * PAYMENT_COUNT_CURRENT
@@ -417,19 +470,24 @@ def paywall_output(json_directory, json_file, payment_count_max, payment_new_wee
                                     "amount" : round(address_balance - payee['address_balance'],6),
                                     "dash_price" : COINMARKET_DASH_PRICE,
                                     "completed_quarter" : str(yr) + "-" + str(qtr),
-                                    "ts_created" : int((datetime.now() - datetime(1970, 1, 1)).total_seconds())
+                                    #"ts_created" : int((datetime.now() - datetime(1970, 1, 1)).total_seconds())
+                                    "ts_created" : int(ptime.time())
                               }
                               payee["payments"].append(new_payment)
                               payee["address_balance"] = address_balance
-
                               if (debug) : print("\nAfter payments added: "+  json.dumps(payee, sort_keys=True, indent=8))
                         if (payee["address_balance"] < current_payment_deposit_limit):
                               payee_out.append(payee)
             if (PAYMENT_COUNT_CURRENT >= PAYMENT_COUNT_MAX) :
                   PAYMENT_COUNT_CURRENT = PAYMENT_COUNT_MAX
+      else:
+        if (debug):
+              print("payee_keys length == %s" % len(payee_keys))
 
       db["pay_to"] = candidates
       db['settings'] = [{'_comment':"payment_new_week options: ['Sun','Mon','Tue','Wed','Thu','Fri','Sat','OFF']",
+                         'campaign_start_epoch': CAMPAIGN_START_EPOCH,
+                         'campaign_start_datestamp': CAMPAIGN_START_DATESTAMP,
                          'payment_count_max':PAYMENT_COUNT_MAX,
                          'payment_new_week':PAYMENT_NEW_WEEK,
                          'payment_new_week_price':PAYMENT_NEW_WEEK_PRICE,
