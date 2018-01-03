@@ -42,7 +42,7 @@ WEB_PAYMENT_NEXT_WEEK_PRICE = 100.00
 WEB_PAYMENT_DEPOSIT_LIMIT = 0.4  # 40/100 usd
 WEB_PAYMENT_COUNT_CURRENT = 0
 WEB_PAYMENT_IS_NEW_WEEK = "no"
-WEB_DEBUG = "true"
+WEB_DEBUG = "false"
 WEB_TESTING = "no"
 
 #########
@@ -61,6 +61,8 @@ epoch_weekdays = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun','Mon']
 QR_URL = "https://chart.googleapis.com/chart?chs=120x120&cht=qr&chl="
 #########
 
+processed_payees = {}
+
 def hrs_until_midnight():
       tomorrow = datetime.today() + timedelta(1)
       midnight = datetime.combine(tomorrow, time())
@@ -76,6 +78,7 @@ def get_payees(candidates):
         candidates[rec]['id'] = rec
         candidates[rec]['value_received'] = 0.0
     return [ candidates[rec] for rec in candidates.keys()]
+
 
 def get_payee_keys(candidates,payment_count_current, payment_count_max,payment_deposit_limit,debug,db):
       payee_keys = []
@@ -117,20 +120,26 @@ def get_payee_keys(candidates,payment_count_current, payment_count_max,payment_d
                   address_balance = .00000001
             #max_payment_todate = float(payment_count_current * payment_deposit_limit)
 
-            max_payment_todate = address_balance + ((1/payment_new_week_price) * (float(current_week * 40.0) - payee['value_received']))
+            dash_due = (1/payment_new_week_price) * (float(current_week * 40.0) - payee['value_received'])
+            max_payment_todate = address_balance + dash_due
+
+            payee['max_payment_todate'] = max_payment_todate
+            payee['max_payment_now'] = "{:.8f}".format(dash_due)
+            payee['dash_due'] = dash_due
 
             max_address_deposit_limit = float(payment_count_max * payment_deposit_limit)
             
             if (debug) :
                   print("payee: %s" % payee['id'])
-                  print("  start week %s " % payee_start_week)
+                  print("  start week %s " % payee['start_week'])
                   print("  address_balance = " + str(address_balance))
                   print("  payment_count_current * payment_deposit_limit = "
                         + str(float(payment_count_current)) + " * "
                         + str(float(payment_deposit_limit)))
                   print("  max_payment_todate = " + str(max_payment_todate))
+                  print("  value_allotment= %s " % float( (current_week - payee['start_week'] + 1) * 40.0))
                   print("  value_received = %s " % payee['value_received'])
-                  print("  value_allotment= %s " % float(current_week * 40.0))
+                  print("  dash_due       = %s " % dash_due)
                   print("  max_address_deposit_limit = " + str(max_address_deposit_limit))
                   print("  address_balance >= max_address_deposit_limit = "
                         + str(address_balance >= max_address_deposit_limit))
@@ -144,6 +153,7 @@ def get_payee_keys(candidates,payment_count_current, payment_count_max,payment_d
             #    or payee['value_received'] >= (current_week * 40)):
             #      continue
             payee_keys.append(payee['id'])
+            processed_payees[payee['id']] = payee
             continue
       if (debug):
             print("candidates <in> " + str(len(candidates)) + "; payees <out> "
@@ -193,11 +203,15 @@ def do_text_out(payee_out, settings, current_payment_deposit_limit,current_payme
       print()
       if len(payee_out) > 0:
             for payee in payee_out:
+                  payee = processed_payees[payee['id']]
                   address = decode(payee["address_signature"])
                   if (len(address) > 0) :
-                        print(str(address) + " > needs "
-                              + str(format(round(current_payment_deposit_limit - payee["address_balance"],4), '.4f'))
-                              + " Dash to be full. -> Address presented is: Valid")
+                      print(
+                          "%s > needs %s Dash to be full. -> Address presented is: Valid" % (
+                              address, payee['max_payment_now']))
+#                        print(str(address) + " > needs "
+#                              + str(format(round(current_payment_deposit_limit - payee["address_balance"],4), '.4f'))
+#                              + " Dash to be full. -> Address presented is: Valid")
                   else:
                         print("Address presented " + payee["address"] + " is: Bad")                                                
       else:
@@ -455,7 +469,9 @@ def paywall_output(json_directory, json_file, payment_count_max, payment_new_wee
                   print("PAYMENT_COUNT_CURRENT " + str(PAYMENT_COUNT_CURRENT))
             candidates = get_dash_chain_totals(payee_keys,db["pay_to"],debug)
             yr,qtr = completed_quarter(datetime.today())
-            for payee in candidates.values():
+            for payee_id in candidates.keys():
+                  payee = candidates[payee_id]
+                  payee['id'] = payee_id
                   if (debug): print("payee : " + json.dumps(payee, sort_keys=True, indent=8))
                   if (payee["active"]):
                         payee.setdefault("total_received", 0.0)
@@ -476,7 +492,7 @@ def paywall_output(json_directory, json_file, payment_count_max, payment_new_wee
                               payee["payments"].append(new_payment)
                               payee["address_balance"] = address_balance
                               if (debug) : print("\nAfter payments added: "+  json.dumps(payee, sort_keys=True, indent=8))
-                        if (payee["address_balance"] < current_payment_deposit_limit):
+                        if payee_id in payee_keys:
                               payee_out.append(payee)
             if (PAYMENT_COUNT_CURRENT >= PAYMENT_COUNT_MAX) :
                   PAYMENT_COUNT_CURRENT = PAYMENT_COUNT_MAX
@@ -515,7 +531,7 @@ def paywall_output(json_directory, json_file, payment_count_max, payment_new_wee
             do_text_out(payee_out, db['settings'], current_payment_deposit_limit,current_payment_deposit_limit_usd, len(db["pay_to"]), PAYMENT_COUNT_CURRENT, PAYMENT_COUNT_MAX, PAYMENT_NEW_WEEK, COINMARKET_DASH_PRICE)
             if (debug) :
                   print("FILE                       - " + src_file)
-                  print("EXPLORER_RECEIVED_BY_URL   - " + EXPLORER_RECEIVED_BY_URL)
+#                  print("EXPLORER_RECEIVED_BY_URL   - " + EXPLORER_RECEIVED_BY_URL)
                   print("PAYMENT_COUNT_MAX          - " + str(PAYMENT_COUNT_MAX))
                   print("PAYMENT_NEW_WEEK           - " + str(PAYMENT_NEW_WEEK))
                   print("PAYMENT_DEPOSIT_LIMIT      - " + str(PAYMENT_DEPOSIT_LIMIT))
